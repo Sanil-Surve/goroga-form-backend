@@ -29,7 +29,7 @@ db = client[os.environ["DB_NAME"]]
 # -------------------- Config --------------------
 JWT_SECRET = os.environ["JWT_SECRET"]
 JWT_ALGORITHM = "HS256"
-MAX_BOOKINGS_PER_SLOT = int(os.environ.get("MAX_BOOKINGS_PER_SLOT", "3"))
+MAX_BOOKINGS_PER_SLOT = int(os.environ.get("MAX_BOOKINGS_PER_SLOT", "2"))
 ADMIN_EMAIL = os.environ["ADMIN_EMAIL"]
 ADMIN_PASSWORD = os.environ["ADMIN_PASSWORD"]
 RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
@@ -159,9 +159,9 @@ class AppointmentCreate(BaseModel):
         if not SLOT_RE.match(v):
             raise ValueError("Slot must be HH:MM (24h)")
         h, m = map(int, v.split(":"))
-        # 8:00 to 17:45 inclusive, every 15 min
-        if h < 8 or h > 17 or (h == 17 and m > 45):
-            raise ValueError("Slot must be between 08:00 and 17:45")
+        # 10:00 to 19:45 inclusive, every 15 min
+        if h < 10 or h > 19 or (h == 19 and m > 45):
+            raise ValueError("Slot must be between 10:00 and 19:45")
         if m not in (0, 15, 30, 45):
             raise ValueError("Slot must be on a 15-minute interval")
         return v
@@ -180,11 +180,11 @@ class StatusUpdate(BaseModel):
 
 # -------------------- Helpers --------------------
 def generate_slots() -> List[str]:
-    """All 15-min slots from 08:00 to 17:45."""
+    """All 15-min slots from 10:00 to 19:45."""
     slots = []
-    for h in range(8, 18):
+    for h in range(10, 20):
         for m in (0, 15, 30, 45):
-            if h == 18:
+            if h == 20:
                 break
             slots.append(f"{h:02d}:{m:02d}")
     return slots
