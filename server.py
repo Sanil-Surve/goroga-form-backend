@@ -19,6 +19,8 @@ from starlette.middleware.cors import CORSMiddleware
 import asyncio
 import resend
 from motor.motor_asyncio import AsyncIOMotorClient
+from pymongo import ReturnDocument
+from pymongo.errors import DuplicateKeyError
 from pydantic import BaseModel, Field, EmailStr, ConfigDict, field_validator
 
 # -------------------- MongoDB --------------------
@@ -390,20 +392,66 @@ async def availability(date: str = Query(..., description="YYYY-MM-DD")):
 # ---- Public booking ----
 @api.post("/appointments", status_code=201)
 async def create_appointment(payload: AppointmentCreate):
-    # Capacity check (exclude cancelled)
-    existing = await db.appointments.count_documents(
-        {"date": payload.date, "slot": payload.slot, "status": {"$ne": "cancelled"}}
-    )
-    if existing >= MAX_BOOKINGS_PER_SLOT:
-        raise HTTPException(status_code=409, detail="This slot is fully booked. Please choose another.")
+    """
+    Atomically reserve a seat in slot_counts before inserting the appointment.
 
-    # Don't allow same email booking same slot twice
+    Race-condition fix
+    ──────────────────
+    Old approach:  count_documents → insert   (two round-trips; two concurrent
+                   requests both pass the count check → overbooking)
+
+    New approach:  find_one_and_update with filter {count: {$lt: MAX}} + upsert
+                   ┌ document doesn't exist yet  → upsert creates {count:1}  ✅
+                   ├ document exists, count < MAX → increments count          ✅
+                   └ document exists, count ≥ MAX → filter misses, upsert
+                     tries to insert a second doc for the same (date,slot)
+                     → DuplicateKeyError (unique index)  → slot full          ✅
+    All three branches are a single atomic MongoDB operation.
+    """
+
+    # ── Step 1: atomically claim one seat ──────────────────────────────────────
+    try:
+        await db.slot_counts.find_one_and_update(
+            {
+                "date": payload.date,
+                "slot": payload.slot,
+                "count": {"$lt": MAX_BOOKINGS_PER_SLOT},
+            },
+            {
+                "$inc": {"count": 1},
+                "$setOnInsert": {"date": payload.date, "slot": payload.slot},
+            },
+            upsert=True,
+            return_document=ReturnDocument.AFTER,
+        )
+    except DuplicateKeyError:
+        # A doc for this (date, slot) already exists with count >= MAX
+        raise HTTPException(
+            status_code=409,
+            detail="This slot is fully booked. Please choose another.",
+        )
+
+    # ── Step 2: prevent the same email booking the same slot twice ─────────────
     dup = await db.appointments.find_one(
-        {"email": payload.email.lower(), "date": payload.date, "slot": payload.slot, "status": {"$ne": "cancelled"}}
+        {
+            "email": payload.email.lower(),
+            "date": payload.date,
+            "slot": payload.slot,
+            "status": {"$ne": "cancelled"},
+        }
     )
     if dup:
-        raise HTTPException(status_code=409, detail="You already have an appointment for this slot.")
+        # Release the seat we just claimed
+        await db.slot_counts.update_one(
+            {"date": payload.date, "slot": payload.slot},
+            {"$inc": {"count": -1}},
+        )
+        raise HTTPException(
+            status_code=409,
+            detail="You already have an appointment for this slot.",
+        )
 
+    # ── Step 3: persist the appointment ───────────────────────────────────────
     appt_id = str(uuid.uuid4())
     doc = {
         "id": appt_id,
@@ -421,8 +469,16 @@ async def create_appointment(payload: AppointmentCreate):
         "created_at": datetime.now(timezone.utc).isoformat(),
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
-    await db.appointments.insert_one(doc)
-    # Fire confirmation email without blocking the response
+    try:
+        await db.appointments.insert_one(doc)
+    except Exception:
+        # Any unexpected insert failure → release the claimed seat
+        await db.slot_counts.update_one(
+            {"date": payload.date, "slot": payload.slot},
+            {"$inc": {"count": -1}},
+        )
+        raise
+
     asyncio.create_task(send_confirmation_email(doc))
     return serialize_appt(doc)
 
@@ -435,8 +491,10 @@ async def list_appointments(
     date_from: Optional[str] = Query(None),
     date_to: Optional[str] = Query(None),
     q: Optional[str] = Query(None),
-    limit: int = Query(200, le=500),
+    page: int = Query(1, ge=1, description="1-indexed page number"),
+    page_size: int = Query(10, ge=1, le=100, description="Records per page"),
 ):
+    # ── Build filter query ─────────────────────────────────────────────────────
     query: dict = {}
     if status_filter and status_filter in APPOINTMENT_STATUSES:
         query["status"] = status_filter
@@ -458,19 +516,38 @@ async def list_appointments(
             {"company": regex},
         ]
 
-    cursor = db.appointments.find(query, {"_id": 0}).sort([("date", -1), ("slot", -1)]).limit(limit)
-    items = [doc async for doc in cursor]
+    # ── Count filtered total (for pagination math) and fetch one page ──────────
+    skip = (page - 1) * page_size
 
-    # Stats
-    total = await db.appointments.count_documents({})
-    booked = await db.appointments.count_documents({"status": "booked"})
-    completed = await db.appointments.count_documents({"status": "completed"})
-    cancelled = await db.appointments.count_documents({"status": "cancelled"})
+    # Run count + 4 stat queries concurrently; cursor is built separately (Motor
+    # cursors are async iterables, not awaitables, so can't go into gather).
+    filtered_total, total_all, booked, completed, cancelled = await asyncio.gather(
+        db.appointments.count_documents(query),
+        db.appointments.count_documents({}),
+        db.appointments.count_documents({"status": "booked"}),
+        db.appointments.count_documents({"status": "completed"}),
+        db.appointments.count_documents({"status": "cancelled"}),
+    )
+
+    cursor = (
+        db.appointments.find(query, {"_id": 0})
+        .sort([("date", -1), ("slot", -1)])
+        .skip(skip)
+        .limit(page_size)
+    )
+    items = [doc async for doc in cursor]
 
     return {
         "items": items,
-        "total": total,
-        "stats": {"total": total, "booked": booked, "completed": completed, "cancelled": cancelled},
+        "total": filtered_total,          # filtered count → drives pagination UI
+        "page": page,
+        "page_size": page_size,
+        "stats": {
+            "total": total_all,
+            "booked": booked,
+            "completed": completed,
+            "cancelled": cancelled,
+        },
     }
 
 
@@ -478,33 +555,87 @@ async def list_appointments(
 async def update_appointment_status(
     appt_id: str, payload: StatusUpdate, admin: dict = Depends(get_current_admin)
 ):
-    res = await db.appointments.update_one(
-        {"id": appt_id},
-        {"$set": {"status": payload.status, "updated_at": datetime.now(timezone.utc).isoformat()}},
-    )
-    if res.matched_count == 0:
+    # Read the appointment first so we know the old status
+    existing = await db.appointments.find_one({"id": appt_id}, {"_id": 0})
+    if not existing:
         raise HTTPException(status_code=404, detail="Appointment not found")
+
+    old_status = existing["status"]
+    new_status = payload.status
+
+    await db.appointments.update_one(
+        {"id": appt_id},
+        {"$set": {"status": new_status, "updated_at": datetime.now(timezone.utc).isoformat()}},
+    )
+
+    # ── Keep slot_counts in sync ───────────────────────────────────────────────
+    # Transitioning TO cancelled → free up a seat
+    if new_status == "cancelled" and old_status != "cancelled":
+        await db.slot_counts.update_one(
+            {"date": existing["date"], "slot": existing["slot"]},
+            {"$inc": {"count": -1}},
+        )
+    # Transitioning FROM cancelled → claim a seat back
+    elif old_status == "cancelled" and new_status != "cancelled":
+        await db.slot_counts.update_one(
+            {"date": existing["date"], "slot": existing["slot"]},
+            {"$inc": {"count": 1}},
+        )
+
     doc = await db.appointments.find_one({"id": appt_id}, {"_id": 0})
     return doc
 
 
 @api.delete("/admin/appointments/{appt_id}")
 async def delete_appointment(appt_id: str, admin: dict = Depends(get_current_admin)):
-    res = await db.appointments.delete_one({"id": appt_id})
-    if res.deleted_count == 0:
+    existing = await db.appointments.find_one({"id": appt_id}, {"_id": 0})
+    if not existing:
         raise HTTPException(status_code=404, detail="Appointment not found")
+
+    await db.appointments.delete_one({"id": appt_id})
+
+    # Only release the seat if the appointment was NOT already cancelled
+    # (cancelled appointments already freed their seat when they were cancelled)
+    if existing["status"] != "cancelled":
+        await db.slot_counts.update_one(
+            {"date": existing["date"], "slot": existing["slot"]},
+            {"$inc": {"count": -1}},
+        )
+
     return {"deleted": True, "id": appt_id}
 
 
 # -------------------- Startup --------------------
 @app.on_event("startup")
 async def startup_event():
+    # ── Core indexes ───────────────────────────────────────────────────────────
     await db.users.create_index("email", unique=True)
     await db.appointments.create_index([("date", 1), ("slot", 1)])
     await db.appointments.create_index("status")
     await db.appointments.create_index("email")
 
-    # Seed admin (idempotent + updates password if changed)
+    # ── slot_counts unique index (enforces atomicity in the booking check) ─────
+    await db.slot_counts.create_index(
+        [("date", 1), ("slot", 1)], unique=True
+    )
+
+    # ── Rebuild slot_counts from existing appointments (migration-safe) ─────────
+    # This runs on every startup and is idempotent. It ensures slot_counts
+    # accurately reflects the live DB even if the server was deployed without
+    # the new code, or after a crash mid-operation.
+    pipeline = [
+        {"$match": {"status": {"$ne": "cancelled"}}},
+        {"$group": {"_id": {"date": "$date", "slot": "$slot"}, "count": {"$sum": 1}}},
+    ]
+    async for row in db.appointments.aggregate(pipeline):
+        await db.slot_counts.update_one(
+            {"date": row["_id"]["date"], "slot": row["_id"]["slot"]},
+            {"$set": {"count": row["count"]}},
+            upsert=True,
+        )
+    logger.info("slot_counts rebuilt from existing appointments")
+
+    # ── Seed admin ─────────────────────────────────────────────────────────────
     existing = await db.users.find_one({"email": ADMIN_EMAIL.lower()})
     if not existing:
         await db.users.insert_one(
