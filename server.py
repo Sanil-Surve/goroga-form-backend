@@ -352,6 +352,45 @@ async def me(admin: dict = Depends(get_current_admin)):
     return admin
 
 
+class AllowedDateInput(BaseModel):
+    date: str
+
+    @field_validator("date")
+    @classmethod
+    def _date(cls, v: str) -> str:
+        if not DATE_RE.match(v):
+            raise ValueError("Date must be YYYY-MM-DD")
+        return v
+
+
+# ---- Allowed Dates ----
+@api.get("/allowed-dates")
+async def get_allowed_dates():
+    cursor = db.allowed_dates.find({}, {"_id": 0})
+    dates = [doc["date"] async for doc in cursor]
+    return sorted(dates)
+
+
+@api.post("/admin/allowed-dates", status_code=201)
+async def add_allowed_date(payload: AllowedDateInput, admin: dict = Depends(get_current_admin)):
+    await db.allowed_dates.update_one(
+        {"date": payload.date},
+        {"$set": {"date": payload.date}},
+        upsert=True
+    )
+    return {"success": True, "date": payload.date}
+
+
+@api.delete("/admin/allowed-dates/{date}")
+async def delete_allowed_date(date: str, admin: dict = Depends(get_current_admin)):
+    if not DATE_RE.match(date):
+        raise HTTPException(status_code=400, detail="Invalid date format")
+    res = await db.allowed_dates.delete_one({"date": date})
+    if res.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Date not found")
+    return {"deleted": True, "date": date}
+
+
 # ---- Availability ----
 @api.get("/availability")
 async def availability(date: str = Query(..., description="YYYY-MM-DD")):
@@ -669,6 +708,14 @@ async def startup_event():
             {"$set": {"password_hash": hash_password(ADMIN_PASSWORD)}},
         )
         logger.info("Updated admin password for: %s", ADMIN_EMAIL)
+
+    # ── Seed allowed dates ─────────────────────────────────────────────────────
+    existing_date = await db.allowed_dates.find_one({"date": "2026-06-11"})
+    if not existing_date:
+        count = await db.allowed_dates.count_documents({})
+        if count == 0:
+            await db.allowed_dates.insert_one({"date": "2026-06-11"})
+            logger.info("Seeded default allowed date: 2026-06-11")
 
 
 @app.on_event("shutdown")

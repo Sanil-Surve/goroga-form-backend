@@ -287,6 +287,40 @@ def test_admin_delete_404(admin_headers):
     assert r.status_code == 404
 
 
+# ----- Allowed Dates CRUD -----
+def test_get_allowed_dates_public():
+    r = requests.get(f"{BASE_URL}/api/allowed-dates")
+    assert r.status_code == 200
+    data = r.json()
+    assert isinstance(data, list)
+    assert "2026-06-11" in data
+
+
+def test_add_allowed_date_unauth():
+    r = requests.post(f"{BASE_URL}/api/admin/allowed-dates", json={"date": "2026-06-12"})
+    assert r.status_code == 401
+
+
+def test_add_delete_allowed_date_auth(admin_headers):
+    r_add = requests.post(
+        f"{BASE_URL}/api/admin/allowed-dates",
+        json={"date": "2026-06-12"},
+        headers=admin_headers
+    )
+    assert r_add.status_code == 201
+    assert r_add.json()["success"] is True
+
+    r_get = requests.get(f"{BASE_URL}/api/allowed-dates")
+    assert "2026-06-12" in r_get.json()
+
+    r_del = requests.delete(f"{BASE_URL}/api/admin/allowed-dates/2026-06-12", headers=admin_headers)
+    assert r_del.status_code == 200
+    assert r_del.json()["deleted"] is True
+
+    r_get2 = requests.get(f"{BASE_URL}/api/allowed-dates")
+    assert "2026-06-12" not in r_get2.json()
+
+
 # ----- Cleanup -----
 def test_zzz_cleanup_test_data(admin_headers, created_appt_ids):
     for aid in created_appt_ids:
