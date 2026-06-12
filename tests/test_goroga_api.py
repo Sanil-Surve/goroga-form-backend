@@ -9,7 +9,7 @@ import requests
 BASE_URL = os.environ["REACT_APP_BACKEND_URL"].rstrip("/") if os.environ.get("REACT_APP_BACKEND_URL") else None
 if not BASE_URL:
     # fallback: read from frontend/.env
-    with open("/app/frontend/.env") as f:
+    with open("./frontend/.env") as f:
         for ln in f:
             if ln.startswith("REACT_APP_BACKEND_URL="):
                 BASE_URL = ln.strip().split("=", 1)[1].rstrip("/")
@@ -88,7 +88,7 @@ def test_availability_bad_date():
 
 
 # ----- Appointment creation -----
-def _payload(email=None, slot="09:00", d=None):
+def _payload(email=None, slot="10:00", d=None):
     return {
         "first_name": "TEST",
         "last_name": "User",
@@ -103,7 +103,7 @@ def _payload(email=None, slot="09:00", d=None):
 
 
 def test_create_appointment_success(created_appt_ids):
-    p = _payload(slot="09:00")
+    p = _payload(slot="10:00")
     r = requests.post(f"{BASE_URL}/api/appointments", json=p)
     assert r.status_code == 201, r.text
     data = r.json()
@@ -115,33 +115,33 @@ def test_create_appointment_success(created_appt_ids):
 
 
 def test_create_invalid_phone():
-    p = _payload(slot="09:15")
+    p = _payload(slot="10:15")
     p["phone"] = "abc"
     r = requests.post(f"{BASE_URL}/api/appointments", json=p)
     assert r.status_code == 422
 
 
 def test_create_invalid_concern():
-    p = _payload(slot="09:30")
+    p = _payload(slot="10:30")
     p["concerns"] = ["not_a_concern"]
     r = requests.post(f"{BASE_URL}/api/appointments", json=p)
     assert r.status_code == 422
 
 
 def test_create_sunday_rejected():
-    p = _payload(slot="09:00", d=SUNDAY)
+    p = _payload(slot="10:00", d=SUNDAY)
     r = requests.post(f"{BASE_URL}/api/appointments", json=p)
     assert r.status_code == 422
 
 
 def test_create_past_date_rejected():
-    p = _payload(slot="09:00", d=(date.today() - timedelta(days=2)).isoformat())
+    p = _payload(slot="10:00", d=(date.today() - timedelta(days=2)).isoformat())
     r = requests.post(f"{BASE_URL}/api/appointments", json=p)
     assert r.status_code == 422
 
 
 def test_create_invalid_slot_off_grid():
-    p = _payload(slot="09:10")
+    p = _payload(slot="10:10")
     r = requests.post(f"{BASE_URL}/api/appointments", json=p)
     assert r.status_code == 422
 
@@ -150,7 +150,7 @@ def test_create_slot_out_of_range():
     p = _payload(slot="07:00")
     r = requests.post(f"{BASE_URL}/api/appointments", json=p)
     assert r.status_code == 422
-    p2 = _payload(slot="18:00")
+    p2 = _payload(slot="20:00")
     r2 = requests.post(f"{BASE_URL}/api/appointments", json=p2)
     assert r2.status_code == 422
 
@@ -231,10 +231,11 @@ def test_admin_list_with_stats(admin_headers):
     r = requests.get(f"{BASE_URL}/api/admin/appointments", headers=admin_headers)
     assert r.status_code == 200
     data = r.json()
-    assert "items" in data and "stats" in data
+    assert "items" in data and "stats" in data and "concerns_analytics" in data
     s = data["stats"]
     for k in ("total", "booked", "completed", "cancelled"):
         assert k in s
+    assert isinstance(data["concerns_analytics"], dict)
 
 
 def test_admin_filter_status(admin_headers):

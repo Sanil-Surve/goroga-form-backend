@@ -519,14 +519,27 @@ async def list_appointments(
     # ── Count filtered total (for pagination math) and fetch one page ──────────
     skip = (page - 1) * page_size
 
-    # Run count + 4 stat queries concurrently; cursor is built separately (Motor
+    async def get_concerns_analytics():
+        pipeline = [
+            {"$match": query},
+            {"$unwind": "$concerns"},
+            {"$group": {"_id": "$concerns", "count": {"$sum": 1}}}
+        ]
+        analytics = {}
+        async for row in db.appointments.aggregate(pipeline):
+            if row["_id"]:
+                analytics[row["_id"]] = row["count"]
+        return analytics
+
+    # Run count + 4 stat queries + concerns analytics concurrently; cursor is built separately (Motor
     # cursors are async iterables, not awaitables, so can't go into gather).
-    filtered_total, total_all, booked, completed, cancelled = await asyncio.gather(
+    filtered_total, total_all, booked, completed, cancelled, concerns_analytics = await asyncio.gather(
         db.appointments.count_documents(query),
         db.appointments.count_documents({}),
         db.appointments.count_documents({"status": "booked"}),
         db.appointments.count_documents({"status": "completed"}),
         db.appointments.count_documents({"status": "cancelled"}),
+        get_concerns_analytics(),
     )
 
     cursor = (
@@ -548,6 +561,7 @@ async def list_appointments(
             "completed": completed,
             "cancelled": cancelled,
         },
+        "concerns_analytics": concerns_analytics,
     }
 
 
